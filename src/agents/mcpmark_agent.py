@@ -542,6 +542,11 @@ class MCPMarkAgent(BaseMCPAgent):
         tool_call_log_file: Optional[str] = None
     ) -> Dict[str, Any]:
         """Execute function calling loop with LiteLLM."""
+        # Generate unique session ID for this execution
+        import os
+        session_id = f"mcpmark_{os.getpid()}_{int(time.time() * 1000)}"
+        logger.info(f"[MCPMark] Generated session ID: {session_id}")
+
         messages = [
             {"role": "system", "content": self.SYSTEM_PROMPT},
             {"role": "user", "content": instruction}
@@ -553,7 +558,7 @@ class MCPMarkAgent(BaseMCPAgent):
         max_consecutive_failures = 3
         hit_turn_limit = False
         ended_normally = False
-        
+
         # Convert functions to tools format for newer models
         tools = [{"type": "function", "function": func} for func in functions] if functions else None
 
@@ -582,13 +587,14 @@ class MCPMarkAgent(BaseMCPAgent):
                     "model": self.litellm_input_model_name,
                     "messages": messages,
                     "api_key": self.api_key,
+                    "extra_body": {"session_id": session_id},  # CRITICAL: Add session_id
                 }
-                
+
                 # Always use tools format if available - LiteLLM will handle conversion
                 if tools:
                     completion_kwargs["tools"] = tools
                     completion_kwargs["tool_choice"] = "auto"
-                
+
                 # Add reasoning_effort and base_url if specified
                 if self.reasoning_effort != "default":
                     completion_kwargs["reasoning_effort"] = self.reasoning_effort
