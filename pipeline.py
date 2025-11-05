@@ -76,6 +76,12 @@ def main():
         choices=["default", "minimal", "low", "medium", "high"],
         help="Reasoning effort level for supported models (default: None)",
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=8,
+        help="Maximum parallel workers for filesystem tests (default: 8)",
+    )
 
     # Output configuration
     parser.add_argument(
@@ -147,6 +153,7 @@ def main():
                 output_dir=run_output_dir,
                 reasoning_effort=args.reasoning_effort,
                 agent_name=args.agent,
+                max_workers=args.max_workers,
             )
 
             pipeline.run_evaluation(args.tasks)

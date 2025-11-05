@@ -1,6 +1,7 @@
 import time
 import json
 import shutil
+import concurrent.futures
 
 from datetime import datetime
 from pathlib import Path
@@ -27,10 +28,12 @@ class MCPEvaluator:
         output_dir: Path = None,
         reasoning_effort: str = "default",
         agent_name: str = "mcpmark",
+        max_workers: int = 8,
     ):
         # Main configuration
         self.mcp_service = mcp_service
         self.timeout = timeout
+        self.max_workers = max_workers
         self.agent_name = (agent_name or "mcpmark").lower()
         if self.agent_name not in AGENT_REGISTRY:
             raise ValueError(f"Unsupported agent '{agent_name}'. Available: {sorted(AGENT_REGISTRY)}")
@@ -293,79 +296,218 @@ class MCPEvaluator:
 
         results = []
 
-        for task in tasks:
-            # --------------------------------------------------------------
-            # Resume check
-            # --------------------------------------------------------------
-            existing_result = self._load_latest_task_result(task)
+        # For filesystem, run in parallel (already isolated via PID-based backups)
+        if self.mcp_service == "filesystem":
+            with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+                future_to_task = {}
 
-            # Decide whether to skip or retry this task
-            retry_due_to_error = (
-                existing_result is not None
-                and not existing_result.success
-                and is_retryable_error(existing_result.error_message)
-            )
+                for task in tasks:
+                    # --------------------------------------------------------------
+                    # Resume check
+                    # --------------------------------------------------------------
+                    existing_result = self._load_latest_task_result(task)
 
-            if existing_result and not retry_due_to_error:
-                # Existing result is either successful or failed with a non-retryable error – skip.
-                logger.info(
-                    "↩️  Skipping already-completed task (resume): %s", task.name
+                    # Decide whether to skip or retry this task
+                    retry_due_to_error = (
+                        existing_result is not None
+                        and not existing_result.success
+                        and is_retryable_error(existing_result.error_message)
+                    )
+
+                    if existing_result and not retry_due_to_error:
+                        # Existing result is either successful or failed with a non-retryable error – skip.
+                        logger.info(
+                            "↩️  Skipping already-completed task (resume): %s", task.name
+                        )
+                        results.append(existing_result)
+                        continue
+
+                    if retry_due_to_error:
+                        # Clean previous artifacts so that new results fully replace them.
+                        task_output_dir = self._get_task_output_dir(task)
+                        if task_output_dir.exists():
+                            shutil.rmtree(task_output_dir)
+                        logger.info(
+                            "🔄 Retrying task due to pipeline error (%s): %s",
+                            existing_result.error_message,
+                            task.name,
+                        )
+
+                    # --------------------------------------------------------------
+                    # Submit task to executor
+                    # --------------------------------------------------------------
+                    future = executor.submit(self._run_single_task, task)
+                    future_to_task[future] = task
+
+                # Collect results as they complete with resilience
+                total_submitted = len(future_to_task)
+                completed_count = 0
+                logger.info(f"Collecting results from {total_submitted} parallel tasks...")
+
+                try:
+                    # Overall timeout: 1 hour for all tasks to complete
+                    for future in concurrent.futures.as_completed(future_to_task, timeout=3600):
+                        task = future_to_task[future]
+
+                        try:
+                            # Per-task timeout: 10 minutes max per task result
+                            task_start = time.time()
+                            task_result = future.result(timeout=600)
+                            task_end = time.time()
+
+                            completed_count += 1
+                            logger.info(f"✓ [{completed_count}/{total_submitted}] Completed: {task.name}")
+
+                            results.append(task_result)
+
+                            # Prepare directory & save
+                            task_output_dir = self._get_task_output_dir(task)
+                            task_output_dir.mkdir(parents=True, exist_ok=True)
+
+                            # Save messages.json (conversation trajectory)
+                            messages_path = task_output_dir / "messages.json"
+
+                            if not messages_path.exists():  # 已经写过就跳过
+                                messages = (
+                                    task_result.model_output
+                                    if getattr(task_result, "model_output", None)
+                                    else []
+                                )
+                                self.results_reporter.save_messages_json(messages, messages_path)
+
+                            # Save meta.json (all other metadata)
+                            meta_path = task_output_dir / "meta.json"
+                            model_config = {
+                                "mcp_service": self.mcp_service,
+                                "model_name": self.model_name,
+                                "litellm_run_model_name": self.litellm_run_model_name,
+                                "reasoning_effort": self.reasoning_effort,
+                                "timeout": self.timeout,
+                                "agent_name": self.agent_name,
+                            }
+                            self.results_reporter.save_meta_json(
+                                task_result,
+                                model_config,
+                                datetime.fromtimestamp(task_start),
+                                datetime.fromtimestamp(task_end),
+                                meta_path,
+                            )
+
+                        except concurrent.futures.TimeoutError:
+                            completed_count += 1
+                            logger.error(f"⏱ [{completed_count}/{total_submitted}] Task result timeout: {task.name}")
+                            # Create a failed TaskResult instead of crashing
+                            failed_result = TaskResult(
+                                task_name=task.name,
+                                success=False,
+                                error_message="Task result collection timed out after 600 seconds",
+                                verification_error=None,
+                                verification_output=None,
+                                category_id=task.category_id,
+                                task_id=task.task_id,
+                                agent_execution_time=0.0,
+                                task_execution_time=600.0,
+                            )
+                            results.append(failed_result)
+
+                        except Exception as e:
+                            completed_count += 1
+                            logger.error(f"❌ [{completed_count}/{total_submitted}] Task exception: {task.name} - {str(e)}")
+                            # Create a failed TaskResult
+                            failed_result = TaskResult(
+                                task_name=task.name,
+                                success=False,
+                                error_message=f"Exception during result collection: {str(e)}",
+                                verification_error=None,
+                                verification_output=None,
+                                category_id=task.category_id,
+                                task_id=task.task_id,
+                                agent_execution_time=0.0,
+                                task_execution_time=0.0,
+                            )
+                            results.append(failed_result)
+
+                except concurrent.futures.TimeoutError:
+                    logger.error(f"⏱ Overall timeout reached! Completed {completed_count}/{total_submitted} tasks")
+                    # Log which tasks didn't complete
+                    incomplete = [t.name for f, t in future_to_task.items() if not f.done()]
+                    if incomplete:
+                        logger.error(f"Incomplete tasks: {', '.join(incomplete)}")
+        else:
+            # Keep sequential execution for non-filesystem services
+            for task in tasks:
+                # --------------------------------------------------------------
+                # Resume check
+                # --------------------------------------------------------------
+                existing_result = self._load_latest_task_result(task)
+
+                # Decide whether to skip or retry this task
+                retry_due_to_error = (
+                    existing_result is not None
+                    and not existing_result.success
+                    and is_retryable_error(existing_result.error_message)
                 )
-                results.append(existing_result)
-                continue
 
-            if retry_due_to_error:
-                # Clean previous artifacts so that new results fully replace them.
+                if existing_result and not retry_due_to_error:
+                    # Existing result is either successful or failed with a non-retryable error – skip.
+                    logger.info(
+                        "↩️  Skipping already-completed task (resume): %s", task.name
+                    )
+                    results.append(existing_result)
+                    continue
+
+                if retry_due_to_error:
+                    # Clean previous artifacts so that new results fully replace them.
+                    task_output_dir = self._get_task_output_dir(task)
+                    if task_output_dir.exists():
+                        shutil.rmtree(task_output_dir)
+                    logger.info(
+                        "🔄 Retrying task due to pipeline error (%s): %s",
+                        existing_result.error_message,
+                        task.name,
+                    )
+
+                # --------------------------------------------------------------
+                # Execute new task
+                # --------------------------------------------------------------
+                task_start = time.time()
+                task_result = self._run_single_task(task)
+                task_end = time.time()
+
+                results.append(task_result)
+
+                # Prepare directory & save
                 task_output_dir = self._get_task_output_dir(task)
-                if task_output_dir.exists():
-                    shutil.rmtree(task_output_dir)
-                logger.info(
-                    "🔄 Retrying task due to pipeline error (%s): %s",
-                    existing_result.error_message,
-                    task.name,
+                task_output_dir.mkdir(parents=True, exist_ok=True)
+
+                # Save messages.json (conversation trajectory)
+                messages_path = task_output_dir / "messages.json"
+
+                if not messages_path.exists():  # 已经写过就跳过
+                    messages = (
+                        task_result.model_output
+                        if getattr(task_result, "model_output", None)
+                        else []
+                    )
+                    self.results_reporter.save_messages_json(messages, messages_path)
+
+                # Save meta.json (all other metadata)
+                meta_path = task_output_dir / "meta.json"
+                model_config = {
+                    "mcp_service": self.mcp_service,
+                    "model_name": self.model_name,
+                    "litellm_run_model_name": self.litellm_run_model_name,
+                    "reasoning_effort": self.reasoning_effort,
+                    "timeout": self.timeout,
+                    "agent_name": self.agent_name,
+                }
+                self.results_reporter.save_meta_json(
+                    task_result,
+                    model_config,
+                    datetime.fromtimestamp(task_start),
+                    datetime.fromtimestamp(task_end),
+                    meta_path,
                 )
-
-            # --------------------------------------------------------------
-            # Execute new task
-            # --------------------------------------------------------------
-            task_start = time.time()
-            task_result = self._run_single_task(task)
-            task_end = time.time()
-
-            results.append(task_result)
-            
-            # Prepare directory & save
-            task_output_dir = self._get_task_output_dir(task)
-            task_output_dir.mkdir(parents=True, exist_ok=True)
-
-            # Save messages.json (conversation trajectory)
-            messages_path = task_output_dir / "messages.json"
-
-            if not messages_path.exists():  # 已经写过就跳过
-                messages = (
-                    task_result.model_output
-                    if getattr(task_result, "model_output", None)
-                    else []
-                )
-                self.results_reporter.save_messages_json(messages, messages_path)
-
-            # Save meta.json (all other metadata)
-            meta_path = task_output_dir / "meta.json"
-            model_config = {
-                "mcp_service": self.mcp_service,
-                "model_name": self.model_name,
-                "litellm_run_model_name": self.litellm_run_model_name,
-                "reasoning_effort": self.reasoning_effort,
-                "timeout": self.timeout,
-                "agent_name": self.agent_name,
-            }
-            self.results_reporter.save_meta_json(
-                task_result,
-                model_config,
-                datetime.fromtimestamp(task_start),
-                datetime.fromtimestamp(task_end),
-                meta_path,
-            )
 
         # --------------------------------------------------------------
         # Aggregate results – combine current `results` with any previously
